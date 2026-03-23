@@ -9,6 +9,7 @@
 #include <ws2tcpip.h>
 #include <direct.h>
 #include <windows.h>
+#include <process.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -19,7 +20,22 @@ typedef SOCKET socket_t;
  */
 #define MAXLINE 4096
 
-static int server_port = 3490;   /* TODO: read from tracker config file. */
+/* Serialize tracker file reads/writes across worker threads. */
+static CRITICAL_SECTION g_tracker_fs_lock;
+
+/* Thread-safe tokenizer: splits in place; returns number of tokens (strtok is not thread-safe). */
+static int split_tokens(char *line, char *tokens[], int max_tokens) {
+    int n = 0;
+    char *p = line;
+    while (*p && n < max_tokens) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        tokens[n++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = '\0';
+    }
+    return n;
+}
 
 static void strip_comment_line(char *line) {
     char *hash = strchr(line, '#');
@@ -256,9 +272,7 @@ static void handle_createtracker(socket_t client, char *line) {
 
     /* Tokenize by spaces; we assume description has no spaces (use underscores). */
     char *tokens[32];
-    int nt = 0;
-    char *p = strtok(line, " ");
-    while (p && nt < 32) { tokens[nt++] = p; p = strtok(NULL, " "); }
+    int nt = split_tokens(line, tokens, 32);
 
     if (nt < 7) {
         send_all(client, "<createtracker fail>\n", strlen("<createtracker fail>\n"));
@@ -312,9 +326,7 @@ static void handle_updatetracker(socket_t client, char *line) {
     trim_angle(line);
 
     char *tokens[32];
-    int nt = 0;
-    char *p = strtok(line, " ");
-    while (p && nt < 32) { tokens[nt++] = p; p = strtok(NULL, " "); }
+    int nt = split_tokens(line, tokens, 32);
 
     if (nt < 6) {
         send_all(client, "<updatetracker unknown fail>\n", strlen("<updatetracker unknown fail>\n"));
@@ -462,11 +474,10 @@ static void handle_list(socket_t client) {
                 tracker_path_for(ffd.cFileName, path);
                 char *content = NULL;
                 size_t content_len = 0;
-                if (read_entire_file(path, &content, &content_len) == 0) free(content);
-
                 char md5hex[33] = "00000000000000000000000000000000";
-                if (content) {
+                if (read_entire_file(path, &content, &content_len) == 0) {
                     md5_bytes_hex(content, content_len, md5hex);
+                    free(content);
                 }
                 char line[1024];
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
@@ -519,15 +530,47 @@ static void handle_get(socket_t client, char *line) {
     free(content);
 }
 
+typedef struct {
+    socket_t client_sock;
+} TrackerClientParam;
+
+static unsigned __stdcall tracker_client_thread(void *arg) {
+    TrackerClientParam *param = (TrackerClientParam *)arg;
+    socket_t client_sock = param->client_sock;
+    free(param);
+
+    char line[4096];
+    int n = recv_line(client_sock, line, sizeof(line));
+    if (n > 0) {
+        EnterCriticalSection(&g_tracker_fs_lock);
+        if (strstr(line, "REQ LIST") != NULL) {
+            handle_list(client_sock);
+        } else if (strstr(line, "GET") != NULL || strstr(line, "get") != NULL) {
+            handle_get(client_sock, line);
+        } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
+            handle_createtracker(client_sock, line);
+        } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
+            handle_updatetracker(client_sock, line);
+        }
+        LeaveCriticalSection(&g_tracker_fs_lock);
+    }
+
+    CLOSESOCK(client_sock);
+    return 0;
+}
+
 int main(void) {
     WSADATA wsa;
-    socket_t listen_sock, client_sock;
+    socket_t listen_sock;
     struct sockaddr_in addr;
-    int port = load_tracker_port_from_client_config(); /* must match clientThreadConfig.cfg */
-    char line[4096];
+
+    int port = load_tracker_port_from_client_config(); /* TODO: Read info from sconfig.cfg */
+
+    InitializeCriticalSection(&g_tracker_fs_lock);
 
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
         fprintf(stderr, "WSAStartup failed\n");
+        DeleteCriticalSection(&g_tracker_fs_lock);
         return EXIT_FAILURE;
     }
 
@@ -535,6 +578,7 @@ int main(void) {
     if (listen_sock == INVALID_SOCKET) {
         fprintf(stderr, "socket() failed\n");
         WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
         return EXIT_FAILURE;
     }
 
@@ -547,6 +591,7 @@ int main(void) {
         fprintf(stderr, "bind() failed\n");
         CLOSESOCK(listen_sock);
         WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
         return EXIT_FAILURE;
     }
 
@@ -554,37 +599,40 @@ int main(void) {
         fprintf(stderr, "listen() failed\n");
         CLOSESOCK(listen_sock);
         WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
         return EXIT_FAILURE;
     }
 
-    printf("Tracker listening on port %d\n", port);
+    printf("Tracker listening on port %d (worker threads)\n", port);
 
     for (;;) {
         struct sockaddr_in caddr;
         int clen = sizeof(caddr);
-        client_sock = accept(listen_sock, (struct sockaddr *)&caddr, &clen);
+        socket_t client_sock = accept(listen_sock, (struct sockaddr *)&caddr, &clen);
         if (client_sock == INVALID_SOCKET) {
             fprintf(stderr, "accept() failed\n");
             continue;
         }
 
-        int n = recv_line(client_sock, line, sizeof(line));
-        if (n > 0) {
-            if (strstr(line, "REQ LIST") != NULL) {
-                handle_list(client_sock);
-            } else if (strstr(line, "GET") != NULL || strstr(line, "get") != NULL) {
-                handle_get(client_sock, line);
-            } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
-                handle_createtracker(client_sock, line);
-            } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
-                handle_updatetracker(client_sock, line);
-            }
+        TrackerClientParam *param = (TrackerClientParam *)malloc(sizeof(TrackerClientParam));
+        if (!param) {
+            CLOSESOCK(client_sock);
+            continue;
         }
+        param->client_sock = client_sock;
 
-        CLOSESOCK(client_sock);
+        uintptr_t th = _beginthreadex(NULL, 0, tracker_client_thread, param, 0, NULL);
+        if (th == 0) {
+            free(param);
+            CLOSESOCK(client_sock);
+            fprintf(stderr, "_beginthreadex failed\n");
+            continue;
+        }
+        CloseHandle((HANDLE)th);
     }
 
     CLOSESOCK(listen_sock);
     WSACleanup();
+    DeleteCriticalSection(&g_tracker_fs_lock);
     return EXIT_SUCCESS;
 }
