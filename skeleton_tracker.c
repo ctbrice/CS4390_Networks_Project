@@ -376,19 +376,9 @@ static void handle_list(SOCKET client, char* line) {
         if (h != INVALID_HANDLE_VALUE) {
             int idx = 1;
             do {
-                if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                char path[512];
-                tracker_path_for(ffd.cFileName, path);
-                char *content = NULL;
-                size_t content_len = 0;
-                char md5hex[33] = "00000000000000000000000000000000";
-                if (read_entire_file(path, &content, &content_len) == 0) {
-                    md5_bytes_hex(content, content_len, md5hex);
-                    free(content);
-                }
                 char line[1024];
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
-                         idx++, ffd.cFileName, (unsigned long)content_len, md5hex);
+                         idx++, ffd.cFileName);
                 send(client, line, strlen(line), 0);
             } while (FindNextFileA(h, &ffd));
             FindClose(h);
