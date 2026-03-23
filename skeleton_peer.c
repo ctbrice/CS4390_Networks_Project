@@ -234,8 +234,18 @@ DWORD WINAPI peer_server_thread(LPVOID arg) {
     server.sin_addr.s_addr = INADDR_ANY;
     server.sin_port = htons(peer_listen_port);
 
-    bind(server_sock, (struct sockaddr *)&server, sizeof(server));
-    listen(server_sock, 5);
+    if(bind(server_sock, (struct sockaddr *)&server, sizeof(server)) == SOCKET_ERROR)
+    {
+        printf("Bind failed\n");
+        return 1;
+    }
+
+
+    if(listen(server_sock, 5) == SOCKET_ERROR)
+    {
+        printf("Listen failed\n");
+        return 1;
+    }
 
     printf("[peer-server] listening on port %d\n", peer_listen_port);
 

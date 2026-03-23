@@ -353,7 +353,7 @@ static void handle_list(SOCKET client, char* line) {
     snprintf(search, sizeof(search), "%s\\*.track", TRACKER_DIR);
 
     WIN32_FIND_DATAA ffd;
-    HANDLE h = FindFirstFileA(search, &ffd);
+    HANDLE h = FindFirstFile(search, &ffd);
 
 	char response[BUFFER_SIZE] = "";
 	strcat(response, "<REP LIST BEGIN>\n");
@@ -362,7 +362,7 @@ static void handle_list(SOCKET client, char* line) {
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) count++;
-        } while (FindNextFileA(h, &ffd));
+        } while (FindNextFile(h, &ffd));
         FindClose(h);
     }
 
