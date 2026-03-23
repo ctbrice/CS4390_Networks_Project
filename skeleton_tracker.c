@@ -211,6 +211,29 @@ static void md5_bytes_hex(const void *data, size_t len, char hex_out[33]) {
     md5_hex(d, hex_out);
 }
 
+static int send_all(socket_t s, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n = send(s, buf + off, (int)(len - off), 0);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_line(socket_t s, char *out, size_t cap) {
+    size_t used = 0;
+    while (used + 1 < cap) {
+        char ch;
+        int n = recv(s, &ch, 1, 0);
+        if (n <= 0) break;
+        out[used++] = ch;
+        if (ch == '\n') break;
+    }
+    out[used] = '\0';
+    return (int)used;
+}
+
 static void trim_eol(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
@@ -369,9 +392,9 @@ static void handle_list(SOCKET client, char* line) {
     char header[64];
     snprintf(header, sizeof(header), "<REP LIST %d>\n", count);
 	strcat(response, header);
-    send(client, response, strlen(response), 0);
+    send_all(client, response, strlen(response));
 
-	send(client, "Debug, yippee!", strlen("Debug, yippee!"), 0);
+	send_all(client, "Debug, yippee!", strlen("Debug, yippee!"));
 
     if (count > 0) {
         h = FindFirstFile(search, &ffd);
@@ -381,13 +404,13 @@ static void handle_list(SOCKET client, char* line) {
                 char line[1024];
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
                          idx++, ffd.cFileName);
-                send(client, line, strlen(line), 0);
+                send_all(client, line, strlen(line));
             } while (FindNextFile(h, &ffd));
             FindClose(h);
         }
     }
 
-    send(client, "<REP LIST END>\n", strlen("<REP LIST END>\n"), 0);
+    send_all(client, "<REP LIST END>\n", strlen("<REP LIST END>\n"));
 }
 
 static void handle_get(SOCKET client, char *line) {
