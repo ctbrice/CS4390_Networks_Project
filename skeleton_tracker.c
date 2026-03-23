@@ -284,7 +284,7 @@ static void handle_updatetracker(socket_t client, char *line) {
     if (!file_exists(path)) {
         char ferr[512];
         snprintf(ferr, sizeof(ferr), "<updatetracker %s ferr>\n", filename);
-        send_all(client, ferr, strlen(ferr));
+        send(client, ferr, strlen(ferr), 0);
         return;
     }
 
@@ -301,33 +301,8 @@ static void handle_updatetracker(socket_t client, char *line) {
         fclose(in);
         char fail[512];
         snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
-        send_all(client, fail, strlen(fail));
+        send(client, fail, strlen(fail), 0);
         return;
-    }
-
-    /* Rewrite tracker file and replace any existing entry for the same peer (ip+port). */
-    char file_line[4096];
-    int replaced = 0;
-    while (fgets(file_line, sizeof(file_line), in)) {
-        char ip_old[128], port_old[32], s_old[64], e_old[64], t_old[64];
-        if (sscanf(file_line, "peer %127s %31s %63s %63s %63s", ip_old, port_old, s_old, e_old, t_old) == 5) {
-            if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
-                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
-                replaced = 1;
-            } else {
-                fputs(file_line, out);
-            }
-        } else if (sscanf(file_line, "peer %127s %31s", ip_old, port_old) == 2) {
-            /* Backward compatibility with older tracker entries without range/time. */
-            if (strcmp(ip_old, ip) == 0 && strcmp(port_old, port) == 0) {
-                fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
-                replaced = 1;
-            } else {
-                fputs(file_line, out);
-            }
-        } else {
-            fputs(file_line, out);
-        }
     }
 
 	time_t now = time(NULL);
@@ -341,7 +316,7 @@ static void handle_updatetracker(socket_t client, char *line) {
         remove(tmp_path);
         char fail[512];
         snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
-        send_all(client, fail, strlen(fail));
+        send(client, fail, strlen(fail), 0);
         return;
     }
 
@@ -371,7 +346,7 @@ static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
     return 0;
 }
 
-static void handle_list(SOCKET client) {
+static void handle_list(SOCKET client, char* line) {
     ensure_tracker_dir();
 
     char search[512];

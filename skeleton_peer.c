@@ -185,7 +185,7 @@ void handle_GET(char* filename) {
     }
 
     fclose(fp);
-    clsoesocket(sock);
+    CLOSESOCK(sock);
 
     printf("Tracker file saved: %s\n", localfile);
 
@@ -271,7 +271,7 @@ DWORD WINAPI peer_server_thread(LPVOID arg) {
     }
 }
 
-DWORD WINAPI tracker_update_thread(LPVOID *arg) {
+DWORD WINAPI tracker_update_thread(LPVOID arg) {
     while(1)
     {
         Sleep(refresh_interval * 1000);
@@ -326,8 +326,8 @@ int main(int argc, char *argv[]) {
 
     HANDLE server_thread, update_thread;
 
-    server_thread = (HANDLE)_beginthreadex(NULL, 0, peer_server_thread, NULL, 0, NULL);
-    update_thread = (HANDLE)_beginthreadex(NULL, 0, tracker_update_thread, NULL, 0, NULL);
+    server_thread = CreateThread(NULL, 0, peer_server_thread, NULL, 0, NULL);
+    update_thread = CreateThread(NULL, 0, tracker_update_thread, NULL, 0, NULL);
 
     cli_loop();
 
