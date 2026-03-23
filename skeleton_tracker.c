@@ -61,6 +61,29 @@ static int first_int_in_line(const char *line, int *out_val) {
     return 0;
 }
 
+static int send_all(socket_t s, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n = send(s, buf + off, (int)(len - off), 0);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_line(socket_t s, char *out, size_t cap) {
+    size_t used = 0;
+    while (used + 1 < cap) {
+        char ch;
+        int n = recv(s, &ch, 1, 0);
+        if (n <= 0) break;
+        out[used++] = ch;
+        if (ch == '\n') break;
+    }
+    out[used] = '\0';
+    return (int)used;
+}
+
 /* Tracker listens on the same port your peer config uses (clientThreadConfig.cfg line 2). */
 static int load_tracker_port_from_client_config(void) {
     FILE *f = fopen("clientThreadConfig.cfg", "r");
@@ -211,29 +234,6 @@ static void md5_bytes_hex(const void *data, size_t len, char hex_out[33]) {
     md5_hex(d, hex_out);
 }
 
-static int send_all(socket_t s, const char *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        int n = send(s, buf + off, (int)(len - off), 0);
-        if (n <= 0) return -1;
-        off += (size_t)n;
-    }
-    return 0;
-}
-
-static int recv_line(socket_t s, char *out, size_t cap) {
-    size_t used = 0;
-    while (used + 1 < cap) {
-        char ch;
-        int n = recv(s, &ch, 1, 0);
-        if (n <= 0) break;
-        out[used++] = ch;
-        if (ch == '\n') break;
-    }
-    out[used] = '\0';
-    return (int)used;
-}
-
 static void trim_eol(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
@@ -370,42 +370,46 @@ static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
 }
 
 static void handle_list(SOCKET client, char* line) {
-    ensure_tracker_dir();
+	ensure_tracker_dir();
 
     char search[512];
     snprintf(search, sizeof(search), "%s\\*.track", TRACKER_DIR);
 
     WIN32_FIND_DATAA ffd;
-    HANDLE h = FindFirstFile(search, &ffd);
-
-	char response[BUFFER_SIZE] = "";
-	strcat(response, "<REP LIST BEGIN>\n");
+    HANDLE h = FindFirstFileA(search, &ffd);
 
     int count = 0;
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) count++;
-        } while (FindNextFile(h, &ffd));
+        } while (FindNextFileA(h, &ffd));
         FindClose(h);
     }
 
     char header[64];
     snprintf(header, sizeof(header), "<REP LIST %d>\n", count);
-	strcat(response, header);
-    send_all(client, response, strlen(response));
-
-	send_all(client, "Debug, yippee!", strlen("Debug, yippee!"));
+    send_all(client, header, strlen(header));
 
     if (count > 0) {
-        h = FindFirstFile(search, &ffd);
+        h = FindFirstFileA(search, &ffd);
         if (h != INVALID_HANDLE_VALUE) {
             int idx = 1;
             do {
+                if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                char path[512];
+                tracker_path_for(ffd.cFileName, path);
+                char *content = NULL;
+                size_t content_len = 0;
+                char md5hex[33] = "00000000000000000000000000000000";
+                if (read_entire_file(path, &content, &content_len) == 0) {
+                    md5_bytes_hex(content, content_len, md5hex);
+                    free(content);
+                }
                 char line[1024];
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
-                         idx++, ffd.cFileName);
+                         idx++, ffd.cFileName, (unsigned long)content_len, md5hex);
                 send_all(client, line, strlen(line));
-            } while (FindNextFile(h, &ffd));
+            } while (FindNextFileA(h, &ffd));
             FindClose(h);
         }
     }
