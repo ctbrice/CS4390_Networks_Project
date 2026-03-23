@@ -371,8 +371,10 @@ static void handle_list(SOCKET client, char* line) {
 	strcat(response, header);
     send(client, response, strlen(response), 0);
 
+	send(client, "Debug, yippee!", strlen("Debug, yippee!"), 0);
+
     if (count > 0) {
-        h = FindFirstFileA(search, &ffd);
+        h = FindFirstFile(search, &ffd);
         if (h != INVALID_HANDLE_VALUE) {
             int idx = 1;
             do {
@@ -380,7 +382,7 @@ static void handle_list(SOCKET client, char* line) {
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
                          idx++, ffd.cFileName);
                 send(client, line, strlen(line), 0);
-            } while (FindNextFileA(h, &ffd));
+            } while (FindNextFile(h, &ffd));
             FindClose(h);
         }
     }
