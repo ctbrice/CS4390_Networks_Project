@@ -18,10 +18,7 @@ typedef SOCKET socket_t;
 
 /* Placeholder values and buffers that the original skeleton assumed existed.
  */
-#define BUFFER_SIZE 4096
-
-// Doubled check and change port stuff later
-#define PORT 5000
+#define MAXLINE 4096
 
 /* Serialize tracker file reads/writes across worker threads. */
 static CRITICAL_SECTION g_tracker_fs_lock;
@@ -211,12 +208,44 @@ static void md5_bytes_hex(const void *data, size_t len, char hex_out[33]) {
     md5_hex(d, hex_out);
 }
 
+static int send_all(socket_t s, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n = send(s, buf + off, (int)(len - off), 0);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_line(socket_t s, char *out, size_t cap) {
+    size_t used = 0;
+    while (used + 1 < cap) {
+        char ch;
+        int n = recv(s, &ch, 1, 0);
+        if (n <= 0) break;
+        out[used++] = ch;
+        if (ch == '\n') break;
+    }
+    out[used] = '\0';
+    return (int)used;
+}
+
 static void trim_eol(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
         s[n - 1] = '\0';
         n--;
     }
+}
+
+static void trim_angle(char *s) {
+    trim_eol(s);
+    /* Trim leading spaces */
+    while (*s == ' ' || *s == '\t') memmove(s, s + 1, strlen(s));
+    if (s[0] == '<') memmove(s, s + 1, strlen(s));
+    size_t n = strlen(s);
+    if (n && s[n - 1] == '>') s[n - 1] = '\0';
 }
 
 static void ensure_tracker_dir(void) {
@@ -233,53 +262,94 @@ static void tracker_path_for(const char *track_name, char out[512]) {
     snprintf(out, 512, "%s\\%s", TRACKER_DIR, track_name);
 }
 
-static void handle_createtracker(SOCKET client, char *line) {
+static long current_unix_time(void) {
+    return (long)time(NULL);
+}
+
+static void handle_createtracker(socket_t client, char *line) {
     /* Expected: <createtracker filename filesize description md5 ip port>\n */
-	char filename[256], desc[256], md5[64], ip[64];
-	int filesize, port;
+    trim_angle(line);
 
-    sscanf(line, "<createtracker %255s %d %255s %63s %63s %d", 
-		filename, &filesize, desc, md5, ip, &port);
+    /* Tokenize by spaces; we assume description has no spaces (use underscores). */
+    char *tokens[32];
+    int nt = split_tokens(line, tokens, 32);
 
-    char path[256];
-	sprintf(path, "%s\\%s.track", TRACKER_DIR, filename);
-
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-		fclose(f);
-        send(client, "<createtracker ferr>\n", strlen("<createtracker ferr>\n"), 0);
+    if (nt < 7) {
+        send_all(client, "<createtracker fail>\n", strlen("<createtracker fail>\n"));
         return;
     }
 
-	f = fopen(path, "wb");
+    const char *filename = tokens[1];
+    const char *filesize = tokens[2];
+    const char *desc = tokens[3];
+    const char *md5 = tokens[4];
+    const char *ip = tokens[5];
+    const char *port = tokens[6];
+
+    char track_name[300];
+    /* If client already passed .track, keep it; otherwise append */
+    size_t fl = strlen(filename);
+    if (fl >= 6 && strcmp(filename + fl - 6, ".track") == 0) {
+        snprintf(track_name, sizeof(track_name), "%s", filename);
+    } else {
+        snprintf(track_name, sizeof(track_name), "%s.track", filename);
+    }
+
+    ensure_tracker_dir();
+    char path[512];
+    tracker_path_for(track_name, path);
+
+    if (file_exists(path)) {
+        send_all(client, "<createtracker ferr>\n", strlen("<createtracker ferr>\n"));
+        return;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        send_all(client, "<createtracker fail>\n", strlen("<createtracker fail>\n"));
+        return;
+    }
 
     /* Minimal tracker file content (format can be adjusted later). */
     fprintf(f, "filename %s\n", filename);
-    fprintf(f, "filesize %d\n", filesize);
+    fprintf(f, "filesize %s\n", filesize);
     fprintf(f, "description %s\n", desc);
     fprintf(f, "md5 %s\n", md5);
-    fprintf(f, "# peers\n");
-
-	time_t now = time(NULL);
-
-	fprintf(f, "peer %s %d 0 %d %ld\n", ip, port, filesize, now);
-
+    fprintf(f, "peer %s %s 0 %s %ld\n", ip, port, filesize, current_unix_time());
     fclose(f);
 
-    send(client, "<createtracker succ>\n", strlen("<createtracker succ>\n"), 0);
+    send_all(client, "<createtracker succ>\n", strlen("<createtracker succ>\n"));
 }
 
 static void handle_updatetracker(socket_t client, char *line) {
     /* Expected: <updatetracker filename start_bytes end_bytes ip-address port-number>\n */
-    char filename[128], ip[64];
-	int start_b, end_b, port;
+    trim_angle(line);
 
-	sscanf(line, "<updatetracker %127s %d %d %63s %d", filename, &start_b, &end_b, ip, &port);
+    char *tokens[32];
+    int nt = split_tokens(line, tokens, 32);
+
+    if (nt < 6) {
+        send_all(client, "<updatetracker unknown fail>\n", strlen("<updatetracker unknown fail>\n"));
+        return;
+    }
+
+    const char *filename = tokens[1];
+    const char *start_b = tokens[2];
+    const char *end_b = tokens[3];
+    const char *ip = tokens[4];
+    const char *port = tokens[5];
+
+    char track_name[300];
+    size_t fl = strlen(filename);
+    if (fl >= 6 && strcmp(filename + fl - 6, ".track") == 0) {
+        snprintf(track_name, sizeof(track_name), "%s", filename);
+    } else {
+        snprintf(track_name, sizeof(track_name), "%s.track", filename);
+    }
 
     ensure_tracker_dir();
     char path[512];
-    tracker_path_for(filename, path);
-	sprintf(path, "%s\\%s.track", TRACKER_DIR, filename);
+    tracker_path_for(track_name, path);
 
     if (!file_exists(path)) {
         char ferr[512];
@@ -290,7 +360,9 @@ static void handle_updatetracker(socket_t client, char *line) {
 
     FILE *in = fopen(path, "rb");
     if (!in) {
-        send(client, "<updatetracker %s ferr>\n", strlen("<updatetracker %s ferr>\n"), 0);
+        char fail[512];
+        snprintf(fail, sizeof(fail), "<updatetracker %s fail>\n", filename);
+        send_all(client, fail, strlen(fail));
         return;
     }
 
@@ -330,9 +402,9 @@ static void handle_updatetracker(socket_t client, char *line) {
         }
     }
 
-	time_t now = time(NULL);
-
-	fprintf(out, "peer %s %d %d %d %ld\n", ip, port, start_b, end_b, now);
+    if (!replaced) {
+        fprintf(out, "peer %s %s %s %s %ld\n", ip, port, start_b, end_b, current_unix_time());
+    }
 
     fclose(in);
     fclose(out);
@@ -347,7 +419,7 @@ static void handle_updatetracker(socket_t client, char *line) {
 
     char succ[512];
     snprintf(succ, sizeof(succ), "<updatetracker %s succ>\n", filename);
-    send(client, succ, strlen(succ), 0);
+    send_all(client, succ, strlen(succ));
 }
 
 static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
@@ -371,7 +443,7 @@ static int read_entire_file(const char *path, char **out_buf, size_t *out_len) {
     return 0;
 }
 
-static void handle_list(SOCKET client) {
+static void handle_list(socket_t client) {
     ensure_tracker_dir();
 
     char search[512];
@@ -379,9 +451,6 @@ static void handle_list(SOCKET client) {
 
     WIN32_FIND_DATAA ffd;
     HANDLE h = FindFirstFileA(search, &ffd);
-
-	char response[BUFFER_SIZE] = "";
-	strcat(response, "<REP LIST BEGIN>\n");
 
     int count = 0;
     if (h != INVALID_HANDLE_VALUE) {
@@ -393,8 +462,7 @@ static void handle_list(SOCKET client) {
 
     char header[64];
     snprintf(header, sizeof(header), "<REP LIST %d>\n", count);
-	strcat(response, header);
-    send(client, response, strlen(response), 0);
+    send_all(client, header, strlen(header));
 
     if (count > 0) {
         h = FindFirstFileA(search, &ffd);
@@ -414,97 +482,81 @@ static void handle_list(SOCKET client) {
                 char line[1024];
                 snprintf(line, sizeof(line), "<%d %s %lu %s>\n",
                          idx++, ffd.cFileName, (unsigned long)content_len, md5hex);
-                send(client, line, strlen(line), 0);
+                send_all(client, line, strlen(line));
             } while (FindNextFileA(h, &ffd));
             FindClose(h);
         }
     }
 
-    send(client, "<REP LIST END>\n", strlen("<REP LIST END>\n"), 0);
+    send_all(client, "<REP LIST END>\n", strlen("<REP LIST END>\n"));
 }
 
-static void handle_get(SOCKET client, char *line) {
+static void handle_get(socket_t client, char *line) {
     /* Expected: <GET filename.track >\n */
-    char filename[256];
-	sscanf(line, "<GET %255s", filename);
+    trim_angle(line);
+    if (strncmp(line, "GET ", 4) != 0 && strncmp(line, "get ", 4) != 0) {
+        send_all(client,
+                 "<REP GET BEGIN>\n<REP GET END 00000000000000000000000000000000>\n",
+                 strlen("<REP GET BEGIN>\n<REP GET END 00000000000000000000000000000000>\n"));
+        return;
+    }
+
+    char *name = line + 4;
+    while (*name == ' ') name++;
+    for (int i = (int)strlen(name) - 1; i >= 0 && (name[i] == ' ' || name[i] == '\t'); i--) name[i] = '\0';
 
     ensure_tracker_dir();
     char path[512];
-    tracker_path_for(filename, path);
+    tracker_path_for(name, path);
 
-	FILE* fp = fopen(path, "rb");
-	if (!fp) {
-		send(client, "File not found\n", strlen("File not found\n"), 0);
-		return;
-	}
+    char *content = NULL;
+    size_t content_len = 0;
+    if (read_entire_file(path, &content, &content_len) != 0) {
+        send_all(client,
+                 "<REP GET BEGIN>\n<REP GET END 00000000000000000000000000000000>\n",
+                 strlen("<REP GET BEGIN>\n<REP GET END 00000000000000000000000000000000>\n"));
+        return;
+    }
 
-	send(client, "<REP GET BEGIN>\n", strlen("<REP GET BEGIN>\n"), 0);
+    char md5hex[33];
+    md5_bytes_hex(content, content_len, md5hex);
 
-    char buffer[BUFFER_SIZE];
-    while(fgets(buffer, BUFFER_SIZE, fp)) {
-		send(client, buffer, strlen(buffer), 0);
-	}
-
-	/* Depreciated MD5 Hex stuff. Come back to it later.*/
-    /*char md5hex[33];
-    md5_bytes_hex(buffer, strlen(buffer), md5hex);
-
-    send(client, "<REP GET BEGIN>\n", strlen("<REP GET BEGIN>\n"));
-    send(client, buffer, strlen(buffer), 0);
+    send_all(client, "<REP GET BEGIN>\n", strlen("<REP GET BEGIN>\n"));
+    send_all(client, content, content_len);
     if (content_len == 0 || content[content_len - 1] != '\n') send_all(client, "\n", 1);
     char endline[128];
     snprintf(endline, sizeof(endline), "<REP GET END %s>\n", md5hex);
     send_all(client, endline, strlen(endline));
-    free(content); */
-
-	fclose(fp);
+    free(content);
 }
 
 typedef struct {
     socket_t client_sock;
 } TrackerClientParam;
 
-DWORD WINAPI tracker_client_thread(LPVOID socket_desc) {
-    SOCKET sock = (SOCKET)socket_desc;
-	char line[BUFFER_SIZE];
+static unsigned __stdcall tracker_client_thread(void *arg) {
+    TrackerClientParam *param = (TrackerClientParam *)arg;
+    socket_t client_sock = param->client_sock;
+    free(param);
 
-    memset(line, 0, BUFFER_SIZE);
-	recv(sock, line, BUFFER_SIZE, 0);
+    char line[4096];
+    int n = recv_line(client_sock, line, sizeof(line));
+    if (n > 0) {
+        EnterCriticalSection(&g_tracker_fs_lock);
+        if (strstr(line, "REQ LIST") != NULL) {
+            handle_list(client_sock);
+        } else if (strstr(line, "GET") != NULL || strstr(line, "get") != NULL) {
+            handle_get(client_sock, line);
+        } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
+            handle_createtracker(client_sock, line);
+        } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
+            handle_updatetracker(client_sock, line);
+        }
+        LeaveCriticalSection(&g_tracker_fs_lock);
+    }
 
-	printf("[tracker] received from peer: %s\n", line);
-
-	if (strstr(line, "createtracker") != NULL) {
-		handle_createtracker(sock, line);
-	} else if (strstr(line, "updatetracker") != NULL) {
-		handle_updatetracker(sock, line);
-	} else if (strstr(line, "REQ LIST") != NULL) {
-		handle_list(sock, line);
-	} else if (strstr(line, "GET") != NULL) {
-		handle_get(sock, line);
-	} else {
-		send(sock, "<ERR unknown command>\n", strlen("<ERR unknown command>\n"), 0);
-	}
-
-    CLOSESOCK(sock);
+    CLOSESOCK(client_sock);
     return 0;
-}
-
-SOCKET setup_server() {
-	SOCKET server_sock;
-    struct sockaddr_in server;
-
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-
-    server.sin_addr.s_addr = INADDR_ANY;
-    server.sin_family = AF_INET;
-    server.sin_port = htons(PORT);
-
-    bind(server_sock, (struct sockaddr *)&server, sizeof(server));
-	listen(server_sock, 5);
-
-	printf("Tracker server listening on port %d\n", PORT);
-
-    return server_sock;
 }
 
 int main(void) {
@@ -522,18 +574,64 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-	SOCKET server_sock = setup_server();
-
-    while (1) {
-		SOCKET client_sock;
-        struct sockaddr_in caddr;
-        int c = sizeof(struct sockaddr_in);
-
-		client_sock = accept(server_sock, (struct sockaddr *)&caddr, &c);
-
-        CreateThread(NULL, 0, tracker_client_thread, (LPVOID)client_sock, 0, NULL);
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock == INVALID_SOCKET) {
+        fprintf(stderr, "socket() failed\n");
+        WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
+        return EXIT_FAILURE;
     }
 
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        fprintf(stderr, "bind() failed\n");
+        CLOSESOCK(listen_sock);
+        WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
+        return EXIT_FAILURE;
+    }
+
+    if (listen(listen_sock, 5) == SOCKET_ERROR) {
+        fprintf(stderr, "listen() failed\n");
+        CLOSESOCK(listen_sock);
+        WSACleanup();
+        DeleteCriticalSection(&g_tracker_fs_lock);
+        return EXIT_FAILURE;
+    }
+
+    printf("Tracker listening on port %d (worker threads)\n", port);
+
+    for (;;) {
+        struct sockaddr_in caddr;
+        int clen = sizeof(caddr);
+        socket_t client_sock = accept(listen_sock, (struct sockaddr *)&caddr, &clen);
+        if (client_sock == INVALID_SOCKET) {
+            fprintf(stderr, "accept() failed\n");
+            continue;
+        }
+
+        TrackerClientParam *param = (TrackerClientParam *)malloc(sizeof(TrackerClientParam));
+        if (!param) {
+            CLOSESOCK(client_sock);
+            continue;
+        }
+        param->client_sock = client_sock;
+
+        uintptr_t th = _beginthreadex(NULL, 0, tracker_client_thread, param, 0, NULL);
+        if (th == 0) {
+            free(param);
+            CLOSESOCK(client_sock);
+            fprintf(stderr, "_beginthreadex failed\n");
+            continue;
+        }
+        CloseHandle((HANDLE)th);
+    }
+
+    CLOSESOCK(listen_sock);
     WSACleanup();
     DeleteCriticalSection(&g_tracker_fs_lock);
     return EXIT_SUCCESS;
