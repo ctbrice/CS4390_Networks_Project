@@ -450,10 +450,10 @@ static void handle_createtracker(socket_t client, char *line) {
     }
 
     /* Minimal tracker file content (format can be adjusted later). */
-    fprintf(f, "filename %s\n", filename);
-    fprintf(f, "filesize %s\n", filesize);
-    fprintf(f, "description %s\n", desc);
-    fprintf(f, "md5 %s\n", md5);
+    fprintf(f, "Filename: %s\n", filename);
+    fprintf(f, "Filesize: %s\n", filesize);
+    fprintf(f, "Description: %s\n", desc);
+    fprintf(f, "MD5: %s\n", md5);
     /* Peer line uses spec-style colon-separated fields. */
     fprintf(f, "peer %s:%s:0:%ld:%ld\n", ip, port, end_b, current_unix_time());
     fclose(f);
@@ -671,11 +671,16 @@ static void handle_get(socket_t client, char *line) {
 
 typedef struct {
     socket_t client_sock;
+    char client_ip[46];
+    int client_port;
 } TrackerClientParam;
 
 static unsigned __stdcall tracker_client_thread(void *arg) {
     TrackerClientParam *param = (TrackerClientParam *)arg;
     socket_t client_sock = param->client_sock;
+    char client_ip[46];
+    strcpy(client_ip, param->client_ip);
+    int client_port = param->client_port;
     free(param);
 
     char line[4096];
@@ -683,16 +688,16 @@ static unsigned __stdcall tracker_client_thread(void *arg) {
     if (n > 0) {
         EnterCriticalSection(&g_tracker_fs_lock);
         if (strstr(line, "REQ LIST") != NULL) {
-            printf("Received LIST request\n");
+            printf("Received LIST request from %s:%d\n", client_ip, client_port);
             handle_list(client_sock);
         } else if (strstr(line, "GET") != NULL || strstr(line, "get") != NULL) {
-            printf("Received GET request\n");
+            printf("Received GET request from %s:%d\n", client_ip, client_port);
             handle_get(client_sock, line);
         } else if (strstr(line, "createtracker") != NULL || strstr(line, "CREATETRACKER") != NULL) {
-            printf("Received CREATE TRACKER request\n");
+            printf("Received CREATE TRACKER request from %s:%d\n", client_ip, client_port);
             handle_createtracker(client_sock, line);
         } else if (strstr(line, "updatetracker") != NULL || strstr(line, "UPDATETRACKER") != NULL) {
-            printf("Received UPDATE TRACKER request\n");
+            printf("Received UPDATE TRACKER request from %s:%d\n", client_ip, client_port);
             handle_updatetracker(client_sock, line);
         }
         LeaveCriticalSection(&g_tracker_fs_lock);
@@ -758,12 +763,18 @@ int main(void) {
             continue;
         }
 
+        char client_ip[46];
+        inet_ntop(AF_INET, &caddr.sin_addr, client_ip, sizeof(client_ip));
+        int client_port = ntohs(caddr.sin_port);
+
         TrackerClientParam *param = (TrackerClientParam *)malloc(sizeof(TrackerClientParam));
         if (!param) {
             CLOSESOCK(client_sock);
             continue;
         }
         param->client_sock = client_sock;
+        strcpy(param->client_ip, client_ip);
+        param->client_port = client_port;
 
         uintptr_t th = _beginthreadex(NULL, 0, tracker_client_thread, param, 0, NULL);
         if (th == 0) {
